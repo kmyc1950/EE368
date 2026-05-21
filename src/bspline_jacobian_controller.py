@@ -7,6 +7,8 @@ import math
 from scipy.interpolate import splprep, splev
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from sensor_msgs.msg import JointState
+# 导入你刚刚写好的 3D RRT* 规划器
+from rrt_star_3d import RRTStar3D
 
 class Gen3LiteBsplineJacobianControl:
     def __init__(self):
@@ -101,35 +103,68 @@ class Gen3LiteBsplineJacobianControl:
         """
         核心步骤一：预先离散化 B 样条，并建立 【物理弧长 s -> 数学参数 u】 的精确映射表
         """
-        # 🚨 单位全面对齐：全部转化为毫米 (mm)！[0.3m -> 300mm]
-        waypoints = np.array([
-            [300.0, -200.0, 150.0],
-            [400.0, -200.0, 150.0],
-            [450.0,    0.0, 150.0],
-            [400.0,  200.0, 150.0],
-            [300.0,  200.0, 150.0]
-        ])
+        # 1. 用“米(m)”定义 RRT* 的起点、终点、障碍物和空间边界
+        start_point = [0.3, -0.2, 0.15]  
+        goal_point = [0.3, 0.2, 0.15]    
+        obstacles = [(0.4, 0.0, 0.15, 0.08)] 
+        bounds = [[0.2, 0.6], [-0.4, 0.4], [0.0, 0.5]] 
         
-        x, y, z = waypoints[:, 0], waypoints[:, 1], waypoints[:, 2]
-        self.tck, _ = splprep([x, y, z], s=0, k=3)
+        # 2. 运行 RRT* 规划器
+        rospy.loginfo("正在运行 RRT* 算法生成避障路径...")
+        rrt_planner = RRTStar3D(start_point, goal_point, obstacles, bounds, max_iter=1500)
+        waypoints_in_meters = rrt_planner.plan()
         
-        # 使用 1000 个超高密度点对曲线进行数值积分
+        # 3. 统一转换为毫米单位
+        raw_waypoints = waypoints_in_meters * 1000.0
+
+        # =================================================================
+        # ✨ 核心修复：过滤掉 RRT* 产生的重复点或距离过近的点 (距离小于 1mm 视为同一点)
+        # =================================================================
+        filtered_wps = [raw_waypoints[0]]
+        for pt in raw_waypoints[1:]:
+            # 计算当前点与上一个有效点之间的欧氏距离
+            dist = np.linalg.norm(pt - filtered_wps[-1])
+            if dist > 1.0:  # 只有两点间距大于 1 毫米，才保留它
+                filtered_wps.append(pt)
+        
+        # 重新包装成 numpy 数组
+        waypoints = np.array(filtered_wps)
+        rospy.loginfo(f"RRT* 原始节点数: {len(raw_waypoints)} -> 过滤后有效节点数: {len(waypoints)}")
+
+        # =================================================================
+        # 4. 生成 B 样条曲线
+        # =================================================================
+        x = waypoints[:, 0]
+        y = waypoints[:, 1]
+        z = waypoints[:, 2]
+        
+        # 动态自适应阶数
+        k_order = 3 if len(waypoints) > 3 else len(waypoints) - 1
+        
+        # 如果过滤完点数实在太少（少于2个点），做一个安全兜底
+        if len(waypoints) < 2:
+            rospy.logerr("RRT* 未能规划出有效路径，请检查起点终点或障碍物设置！")
+            return
+
+        # 此时有了去重保障，splprep 绝对不会再报错了！
+        self.tck, _ = splprep([x, y, z], s=0, k=k_order)
+
+        # 5. 使用 1000 个超高密度点对曲线进行数值积分（保持你后续的代码不变）
         u_fine = np.linspace(0, 1, 1000)
         xf, yf, zf = splev(u_fine, self.tck)
-        
+
         dx = np.diff(xf)
         dy = np.diff(yf)
         dz = np.diff(zf)
         ds = np.sqrt(dx**2 + dy**2 + dz**2)
-        
-        # 构成累积弧长数组 s
+
         self.s_cumulative = np.concatenate(([0], np.cumsum(ds)))
         self.u_fine = u_fine
         self.total_length = self.s_cumulative[-1]
-        
+
         rospy.loginfo(f"==== B-Spline Ready ====")
         rospy.loginfo(f"Total physical path length: {self.total_length:.2f} mm")
-        rospy.loginfo(f"Estimated duration at {self.vc} mm/s: {self.total_length/self.vc:.2f} seconds")
+        rospy.loginfo(f"Estimated duration at {self.vc} mm/s: {self.total_length/self.vc:.2f} s")
 
     def get_target_pos(self, s_desired):
         """ 根据期望走过的物理弧长，通过插值反查当前在 B 样条上的目标位置 X_d """
@@ -149,11 +184,22 @@ class Gen3LiteBsplineJacobianControl:
             rospy.loginfo_throttle(1.0, "Waiting for Gazebo joint states connection...")
             rate.sleep()
             
-        rospy.loginfo(">>>>> Commencing Jacobian Constant-Speed Control Loop <<<<<")
+        rospy.loginfo("成功连接 Gazebo！开始获取机械臂当前真实位置作为规划起点...")
+        q_init = np.array(self.current_q)
+        T_ee_init, _ = self.compute_fk_and_jacobian(q_init)
         
+        # 拿到当前的真实末端坐标 (注意：正运动学输出是毫米，我们要除以 1000 变成米给 RRT*)
+        self.real_start_m = T_ee_init[0:3, 3] / 1000.0 
+        
+        # 此时去调用轨迹准备函数（记得去 prepare_arc_length_bspline 内部，
+        # 把 start_point 改成 self.real_start_m ！）
+        self.prepare_arc_length_bspline()
+
+        rospy.loginfo(">>>>>> Commencing Jacobian Constant-Speed Control Loop <<<<<<")
+
         start_time = rospy.get_time()
         X_d_prev = None
-        
+
         while not rospy.is_shutdown():
             # 计算当前运行的时间 t
             t = rospy.get_time() - start_time
